@@ -19,10 +19,9 @@ local ti = ffi.types
 local Gdk = LuaGObject.Gdk
 local cairo = LuaGObject.cairo
 
--- Take over internal GDK synchronization lock in Gdk3.
+-- Make sure that Gdk is initialized with threads.
 -- This API does not exist in Gdk4.
 if core.gi.Gdk.resolve.gdk_threads_set_lock_functions then
-   core.registerlock(core.gi.Gdk.resolve.gdk_threads_set_lock_functions)
    Gdk.threads_init()
 end
 

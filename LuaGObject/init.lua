@@ -19,7 +19,7 @@ local LuaGObject = {
 }
 
 -- Forward selected core methods into external interface.
-for _, name in pairs { 'yield', 'lock', 'enter', 'leave' } do
+for _, name in pairs { 'yield', 'pool', 'enter', 'leave' } do
 	LuaGObject[name] = core[name]
 end
 

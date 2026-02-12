@@ -15,17 +15,15 @@ static int object_mt;
 /* lightuserdata key to registry, containing 'env' table, which maps lightuserdata(obj-addr) -> obj-env-table. */
 static int env;
 
-/* Keys in 'env' table containing quark used as object's qdata for env and thread which is used from qdata destroy callback. */
+/* Keys in 'env' table containing quark used as object's qdata for env. */
 enum {
-	OBJECT_QDATA_ENV = 1,
-	OBJECT_QDATA_THREAD
+	OBJECT_QDATA_ENV = 1
 };
 
 /* Structure stored in GObject's qdata at OBJECT_QDATA_ENV. */
 typedef struct _ObjectData {
 	gpointer object;
-	gpointer state_lock;
-	lua_State *L;
+	gpointer state_pool;
 } ObjectData;
 
 /* lightuserdata key to registry, containing metatable for object env guard. */
@@ -403,8 +401,7 @@ static void
 object_data_destroy(gpointer user_data)
 {
 	ObjectData *data = user_data;
-	lua_State *L = data->L;
-	lua_gobject_state_enter(data->state_lock);
+	lua_State *L = lua_gobject_state_enter(data->state_pool, NULL);
 	luaL_checkstack(L, 4, NULL);
 
 	/* Release 'obj' entry from 'env' table. */
@@ -422,7 +419,7 @@ object_data_destroy(gpointer user_data)
 	lua_pop(L, 2);
 
 	/* Leave the context and destroy data structure. */
-	lua_gobject_state_leave(data->state_lock);
+	lua_gobject_state_leave(data->state_pool, L);
 	g_free(data);
 }
 
@@ -478,9 +475,7 @@ object_env(lua_State *L)
 		object's qdata. */
 		data = g_new(ObjectData, 1);
 		data->object = obj;
-		lua_rawgeti(L, -4, OBJECT_QDATA_THREAD);
-		data->L = lua_tothread(L, -1);
-		data->state_lock = lua_gobject_state_get_lock(data->L);
+		data->state_pool = lua_gobject_state_get_pool(L);
 
 		/* Attach ObjectData to the object. */
 		g_object_set_qdata_full(G_OBJECT(obj), guard->id,
@@ -570,10 +565,6 @@ lua_gobject_object_init(lua_State *L)
 	lua_pushinteger(L, g_quark_from_string(id));
 	g_free(id);
 	lua_rawseti(L, -2, OBJECT_QDATA_ENV);
-
-	/* Add OBJECT_QDATA_THREAD to env table. */
-	lua_newthread(L);
-	lua_rawseti(L, -2, OBJECT_QDATA_THREAD);
 
 	/* Add 'env' table to the registry. */
 	lua_rawset(L, LUA_REGISTRYINDEX);

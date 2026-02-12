@@ -28,7 +28,7 @@ The returned functions are for logging messages. They accept a format string and
 
 - `LuaGObject.yield()`
 
-When called, unlocks LuaGObject's state lock, thus allowing potentially blocked callbacks or signals to enter the Lua state. When using LuaGObject with GLib's MainLoop (which is automatically started when intializing Gtk or Adw), this call is not needed at all.
+When called, releases this Lua state into LuaGObject's state pool, thus allowing potentially blocked callbacks or signals to enter it. When using LuaGObject with GLib's MainLoop (which is automatically started when intializing Gtk or Adw), this call is not needed at all.
 
 ## GObject Basic Constructs
 

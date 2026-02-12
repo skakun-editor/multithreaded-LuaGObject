@@ -92,11 +92,11 @@ int lua_gobject_gi_info_new (lua_State *L, GIBaseInfo *info);
 gpointer lua_gobject_gi_load_function(lua_State *L, int typetable, const char *name);
 
 /* Retrieve synchronization state, which can be used for entering and leaving the state using lua_gobject_state_enter() and lua_gobject_state_leave(). */
-gpointer lua_gobject_state_get_lock (lua_State *L);
+gpointer lua_gobject_state_get_pool (lua_State *L);
 
 /* Enters/leaves Lua state. */
-void lua_gobject_state_enter (gpointer left_state);
-void lua_gobject_state_leave (gpointer state_lock);
+lua_State *lua_gobject_state_enter (gpointer state_pool, lua_State *L);
+void lua_gobject_state_leave (gpointer state_pool, lua_State *L);
 
 /* Special value for 'parent' argument of marshal_2c/lua.  When parent is set to this value, marshalling takes place always into pointer on the C side.  This isuseful when marshalling value from/to lists, arrays and hashtables. */
 #define LUA_GOBJECT_PARENT_FORCE_POINTER G_MAXINT

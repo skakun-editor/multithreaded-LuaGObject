@@ -284,67 +284,82 @@ core_constant(lua_State *L)
 	return 1;
 }
 
-typedef struct _LgiStateMutex
+typedef struct _LgiStatePool
 {
-	/* Pointer to either local state lock(next member of this structure) or to global package lock. */
-	GRecMutex *mutex;
-	GRecMutex state_mutex;
-} LgiStateMutex;
+	GRecMutex lock;
+	lua_State *states[32];
+	int statec;
+	GCond new_state;
+} LgiStatePool;
 
-/* Global package lock(the one used for gdk_threads_enter/clutter_threads_enter) */
-static GRecMutex package_mutex G_REC_MUTEX_INIT;
-
-/* GC method for GRecMutex structure, which lives inside lua_State. */
+/* GC method for LgiStatePool structure, which lives inside lua_State. */
 static int
-call_mutex_gc(lua_State* L)
+state_pool_gc(lua_State* L)
 {
-	LgiStateMutex *mutex = lua_touserdata(L, 1);
-	g_rec_mutex_unlock(mutex->mutex);
-	g_rec_mutex_clear(&mutex->state_mutex);
+	LgiStatePool *pool = lua_touserdata(L, 1);
+	g_assert(pool->statec == 0);
+	g_rec_mutex_clear(&pool->lock);
+	g_cond_clear(&pool->new_state);
 	return 0;
 }
 
-/* MT for CallMutex. */
-static int call_mutex_mt;
+/* MT for LgiStatePool. */
+static int state_pool_mt;
 
-/* lightuserdata of address of this member is key to LUA_REGISTRYINDEX where CallMutex instance for this state resides. */
-static int call_mutex;
+/* lightuserdata of address of this member is key to LUA_REGISTRYINDEX where LgiStatePool instance for this state resides. */
+static int state_pool;
 
 gpointer
-lua_gobject_state_get_lock(lua_State *L)
+lua_gobject_state_get_pool(lua_State *L)
 {
-	gpointer state_lock;
-	lua_pushlightuserdata(L, &call_mutex);
+	gpointer pool;
+	lua_pushlightuserdata(L, &state_pool);
 	lua_gettable(L, LUA_REGISTRYINDEX);
-	state_lock = lua_touserdata(L, -1);
+	pool = lua_touserdata(L, -1);
 	lua_pop(L, 1);
-	return state_lock;
+	return pool;
 }
 
-void
-lua_gobject_state_enter(gpointer state_lock)
+lua_State *
+lua_gobject_state_enter(gpointer state_pool, lua_State *L)
 {
-	LgiStateMutex *mutex = state_lock;
-	GRecMutex *wait_on;
+	LgiStatePool *pool = state_pool;
+	int i;
+	gboolean did_receive_signal = FALSE;
+	lua_State *result = NULL;
 
-	/* There is a complication with lock switching. During the wait for the lock, someone could call core.registerlock() and thus change the lock protecting the state. Accomodate for this situation. */
+	g_rec_mutex_lock(&pool->lock);
 	for (;;) {
-		wait_on = g_atomic_pointer_get(&mutex->mutex);
-		g_rec_mutex_lock(wait_on);
-		if (wait_on == mutex->mutex)
+		i = 0;
+		if (L != NULL)
+			while (i < pool->statec && pool->states[i] != L)
+				i++;
+		if (i < pool->statec) {
+			result = pool->states[i];
+			pool->states[i] = pool->states[pool->statec - 1];
+			pool->states[--pool->statec] = NULL;
 			break;
-
-		/* The lock is changed, unlock this one and wait again. */
-		g_rec_mutex_unlock(wait_on);
+		}
+		/* Pass on the signal we received and ignored to another thread. */
+		if (did_receive_signal && pool->statec > 0)
+			g_cond_signal(&pool->new_state);
+		g_cond_wait(&pool->new_state, &pool->lock);
+		did_receive_signal = TRUE;
 	}
+	g_rec_mutex_unlock(&pool->lock);
+
+	return result;
 }
 
 void
-lua_gobject_state_leave(gpointer state_lock)
+lua_gobject_state_leave(gpointer state_pool, lua_State *L)
 {
-	/* Get pointer to the call mutex belonging to this state. */
-	LgiStateMutex *mutex = state_lock;
-	g_rec_mutex_unlock(mutex->mutex);
+	LgiStatePool *pool = state_pool;
+	g_rec_mutex_lock(&pool->lock);
+	g_assert(pool->statec < G_N_ELEMENTS(pool->states));
+	pool->states[pool->statec++] = L;
+	g_cond_signal(&pool->new_state);
+	g_rec_mutex_unlock(&pool->lock);
 }
 
 static const char* log_levels[] = {
@@ -371,62 +386,11 @@ core_log(lua_State *L)
 static int
 core_yield(lua_State *L)
 {
-	/* Perform yield with unlocked mutex; this might force another threads waiting on the mutex to perform what they need to do (i.e. enter Lua with callbacks). */
-	gpointer state_lock = lua_gobject_state_get_lock(L);
-	lua_gobject_state_leave(state_lock);
+	/* Perform yield with thread in the pool; this might force another threads waiting on a free thread to perform what they need to do (i.e. enter Lua with callbacks). */
+	gpointer state_pool = lua_gobject_state_get_pool(L);
+	lua_gobject_state_leave(state_pool, L);
 	g_thread_yield();
-	lua_gobject_state_enter(state_lock);
-	return 0;
-}
-
-static void
-package_lock_enter(void)
-{
-	g_rec_mutex_lock(&package_mutex);
-}
-
-static void
-package_lock_leave(void)
-{
-	g_rec_mutex_unlock(&package_mutex);
-}
-
-static gpointer package_lock_register[8] = { NULL };
-
-static int
-core_registerlock(lua_State *L)
-{
-	void(*set_lock_functions)(GCallback, GCallback);
-	LgiStateMutex *mutex;
-	GRecMutex *wait_on;
-	unsigned i;
-
-	/* Get registration function. */
-	luaL_checktype(L, 1, LUA_TLIGHTUSERDATA);
-	set_lock_functions = lua_touserdata(L, 1);
-	luaL_argcheck(L, set_lock_functions != NULL, 1, "NULL function");
-
-	/* Check, whether this package was already registered. */
-	for (i = 0; i < G_N_ELEMENTS(package_lock_register) &&
-		package_lock_register[i] != set_lock_functions; i++) {
-		if (package_lock_register[i] == NULL) {
-			/* Register our package lock functions. */
-			package_lock_register[i] = set_lock_functions;
-			set_lock_functions(package_lock_enter, package_lock_leave);
-			break;
-		}
-	}
-
-	/* Switch our statelock to actually use packagelock. */
-	lua_pushlightuserdata(L, &call_mutex);
-	lua_rawget(L, LUA_REGISTRYINDEX);
-	mutex = lua_touserdata(L, -1);
-	wait_on = g_atomic_pointer_get(&mutex->mutex);
-	if (wait_on != &package_mutex) {
-		g_rec_mutex_lock(&package_mutex);
-		g_atomic_pointer_set(&mutex->mutex, &package_mutex);
-		g_rec_mutex_unlock(wait_on);
-	}
+	lua_gobject_state_enter(state_pool, L);
 	return 0;
 }
 
@@ -568,7 +532,6 @@ static const struct luaL_Reg lua_gobject_reg[] = {
 	{ "repotype", core_repotype },
 	{ "constant", core_constant },
 	{ "yield", core_yield },
-	{ "registerlock", core_registerlock },
 	{ "band", core_band },
 	{ "bor", core_bor },
 	{ "module", core_module },
@@ -645,7 +608,7 @@ set_resident(lua_State *L)
 G_MODULE_EXPORT int
 luaopen_LuaGObject_lua_gobject_core(lua_State* L)
 {
-	LgiStateMutex *mutex;
+	LgiStatePool *pool;
 	gint state_id;
 
 	/* Try to make itself resident. This is needed because this dynamic module is 'statically' linked with glib/gobject, and these libraries are not designed to be unloaded. Once they are unloaded, they cannot be safely loaded again into the same process. To avoid problems when repeatedly opening and closing lua_States and loading lua_gobject into them, we try to make the whole 'core' module resident. */
@@ -675,20 +638,20 @@ luaopen_LuaGObject_lua_gobject_core(lua_State* L)
 	luaL_register(L, NULL, module_reg);
 	lua_pop(L, 1);
 
-	/* Register 'call-mutex' metatable. */
-	lua_pushlightuserdata(L, &call_mutex_mt);
+	/* Register 'state-pool' metatable. */
+	lua_pushlightuserdata(L, &state_pool_mt);
 	lua_newtable(L);
-	lua_pushcfunction(L, call_mutex_gc);
+	lua_pushcfunction(L, state_pool_gc);
 	lua_setfield(L, -2, "__gc");
 	lua_rawset(L, LUA_REGISTRYINDEX);
 
-	/* Create call mutex guard, keep it locked initially(it is unlocked only when we are calling out to GObject-C code) and store it into the registry. */
-	lua_pushlightuserdata(L, &call_mutex);
-	mutex = lua_newuserdata(L, sizeof(*mutex));
-	mutex->mutex = &mutex->state_mutex;
-	g_rec_mutex_init(&mutex->state_mutex);
-	g_rec_mutex_lock(&mutex->state_mutex);
-	lua_pushlightuserdata(L, &call_mutex_mt);
+	/* Create state pool and store it into the registry. */
+	lua_pushlightuserdata(L, &state_pool);
+	pool = lua_newuserdata(L, sizeof(*pool));
+	g_rec_mutex_init(&pool->lock);
+	pool->statec = 0;
+	g_cond_init(&pool->new_state);
+	lua_pushlightuserdata(L, &state_pool_mt);
 	lua_rawget(L, LUA_REGISTRYINDEX);
 	lua_setmetatable(L, -2);
 	lua_rawset(L, LUA_REGISTRYINDEX);
@@ -705,9 +668,9 @@ luaopen_LuaGObject_lua_gobject_core(lua_State* L)
 		lua_pushfstring(L, "+L%d", state_id);
 	lua_setfield(L, -2, "id");
 
-	/* Add lock and enter/leave locking functions. */
-	lua_pushlightuserdata(L, lua_gobject_state_get_lock(L));
-	lua_setfield(L, -2, "lock");
+	/* Add pool and enter/leave locking functions. */
+	lua_pushlightuserdata(L, lua_gobject_state_get_pool(L));
+	lua_setfield(L, -2, "pool");
 	lua_pushlightuserdata(L, lua_gobject_state_enter);
 	lua_setfield(L, -2, "enter");
 	lua_pushlightuserdata(L, lua_gobject_state_leave);

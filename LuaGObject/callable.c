@@ -90,17 +90,14 @@ typedef struct _Callable {
 /* Address is lightuserdata of Callable metatable in Lua registry. */
 static int callable_mt;
 
-/* Lua thread that can be used for argument marshaling if needed. This address is used as a lightuserdata index in the registry. */
-static int marshalling_L_address;
-
 /* Structure containing basic callback information. */
 typedef struct _Callback {
 	/* Thread which created callback and Lua-reference to it(so that it is not GCed). */
 	lua_State *L;
 	int thread_ref;
 
-	/* State lock, to be passed to lua_gobject_state_enter() when callback is invoked. */
-	gpointer state_lock;
+	/* State pool, to be passed to lua_gobject_state_enter() when callback is invoked. */
+	gpointer state_pool;
 } Callback;
 
 typedef struct _FfiClosureBlock FfiClosureBlock;
@@ -750,7 +747,7 @@ callable_call(lua_State *L)
 	GIArgument retval, *args;
 	void **ffi_args, **redirect_out;
 	GError *err = NULL;
-	gpointer state_lock = lua_gobject_state_get_lock(L);
+	gpointer state_pool = lua_gobject_state_get_pool(L);
 	Callable *callable = callable_get(L, 1);
 
 	/* Make sure that all unspecified arguments are set as nil; during marshalling we might create temporary values on the stack, which can be confused with input arguments expected but not passed by caller. */
@@ -846,13 +843,13 @@ callable_call(lua_State *L)
 	}
 
 	/* Unlock the state. */
-	lua_gobject_state_leave(state_lock);
+	lua_gobject_state_leave(state_pool, L);
 
 	/* Call the function. */
 	ffi_call(&callable->cif, callable->address, &retval, ffi_args);
 
 	/* Heading back to Lua, lock the state back again. */
-	lua_gobject_state_enter(state_lock);
+	lua_gobject_state_enter(state_pool, L);
 
 	/* Pop any temporary items from the stack which might be stored there by marshalling code. */
 	lua_pop(L, nret);
@@ -1153,21 +1150,20 @@ closure_callback(ffi_cif *cif, void *ret, void **args, void *closure_arg)
 	(void)cif;
 
 	/* Get access to proper Lua context. */
-	lua_gobject_state_enter(block->callback.state_lock);
-	lua_rawgeti(block->callback.L,
+	marshal_L = lua_gobject_state_enter(block->callback.state_pool, NULL);
+	lua_rawgeti(marshal_L,
 		LUA_REGISTRYINDEX, block->callback.thread_ref);
-	L = lua_tothread(block->callback.L, -1);
+	L = lua_tothread(marshal_L, -1);
 	call =(closure->target_ref != LUA_NOREF);
 	if (call) {
 		/* We will call target method, prepare context/thread to do it. */
-		if (lua_status(L) != 0)
 		{
-			/* Thread is not in usable state for us, it is suspended, we cannot afford to resume it, because it is possible that the routine we are about to call is actually going to resume it.  Create new thread instead and switch closure to its context. */
-			lua_State *newL = lua_newthread(L);
-			lua_rawseti(L, LUA_REGISTRYINDEX, block->callback.thread_ref);
+			/* Thread is not in usable state for us, it may be in use by another thread.  Create new thread instead and switch closure to its context. */
+			lua_State *newL = lua_newthread(marshal_L);
+			lua_rawseti(marshal_L, LUA_REGISTRYINDEX, block->callback.thread_ref);
 			L = newL;
 		}
-		lua_pop(block->callback.L, 1);
+		lua_pop(marshal_L, 1);
 		block->callback.L = L;
 
 		/* Remember stacktop, this is the position on which we should
@@ -1178,24 +1174,14 @@ closure_callback(ffi_cif *cif, void *ret, void **args, void *closure_arg)
 		/* Store function to be invoked to the stack. */
 		lua_rawgeti(L, LUA_REGISTRYINDEX, closure->target_ref);
 	} else {
-		/* Cleanup the stack of the original thread. */
-		lua_pop(block->callback.L, 1);
+		/* Cleanup the stack of the hijacked thread. */
+		lua_pop(marshal_L, 1);
 		stacktop = lua_gettop(L);
 		if (lua_status(L) == 0) {
 			/* Thread is not suspended yet, so it contains initial function at the top of the stack, so count with it. */
 			stacktop--;
 			extra_args++;
 		}
-	}
-
-	/* Pick a coroutine used for marshalling */
-	marshal_L = L;
-	if (lua_status(marshal_L) == LUA_YIELD) {
-		lua_pushlightuserdata(L, &marshalling_L_address);
-		lua_rawget(L, LUA_REGISTRYINDEX);
-		marshal_L = lua_tothread(L, -1);
-		lua_pop(L, 1);
-		g_assert(lua_gettop(marshal_L) == 0);
 	}
 
 	/* Get access to Callable structure. */
@@ -1235,9 +1221,9 @@ closure_callback(ffi_cif *cif, void *ret, void **args, void *closure_arg)
 			/* For our purposes is YIELD the same as if the coro really returned. */
 			res = 0;
 		else if (res == LUA_ERRRUN && !callable->throws) {
-			/* If closure is not allowed to return errors and coroutine finished with error, rethrow the error in the context of the original thread. */
-			lua_xmove(L, block->callback.L, 1);
-			lua_error(block->callback.L);
+			/* If closure is not allowed to return errors and coroutine finished with error, rethrow the error in the context of the hijacked thread. */
+			lua_xmove(L, marshal_L, 1);
+			lua_error(marshal_L);
 		}
 
 		/* If coroutine somehow consumed more than expected(?), do not
@@ -1270,7 +1256,7 @@ closure_callback(ffi_cif *cif, void *ret, void **args, void *closure_arg)
 		lua_settop(marshal_L, 0);
 
 	/* Going back to C code, release the state synchronization. */
-	lua_gobject_state_leave(block->callback.state_lock);
+	lua_gobject_state_leave(block->callback.state_pool, marshal_L);
 }
 
 /* Destroys specified closure. */
@@ -1323,8 +1309,8 @@ lua_gobject_closure_allocate(lua_State *L, int count)
 	lua_pushthread(L);
 	block->callback.thread_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 
-	/* Retrieve and remember state lock. */
-	block->callback.state_lock = lua_gobject_state_get_lock(L);
+	/* Retrieve and remember state pool. */
+	block->callback.state_pool = lua_gobject_state_get_pool(L);
 	return block;
 }
 
@@ -1397,11 +1383,6 @@ static const luaL_Reg callable_api_reg[] = {
 void
 lua_gobject_callable_init(lua_State *L)
 {
-	/* Create a thread for marshalling arguments to yielded threads, register it so that it is not GC'd. */
-	lua_pushlightuserdata(L, &marshalling_L_address);
-	lua_newthread(L);
-	lua_rawset(L, LUA_REGISTRYINDEX);
-
 	/* Register callable metatable. */
 	lua_pushlightuserdata(L, &callable_mt);
 	lua_newtable(L);
